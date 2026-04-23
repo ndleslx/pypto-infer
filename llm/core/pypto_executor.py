@@ -96,6 +96,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         seq_lens = torch.tensor([seq_len], dtype=torch.int32)
         block_table = torch.full((max_blocks,), -1, dtype=torch.int32)
+        slot_mapping = self._kv_cache_manager.slot_mapping_for_positions(alloc, seq_len, max_tokens=max_seq)
         if alloc.page_ids:
             block_table[: len(alloc.page_ids)] = torch.tensor(alloc.page_ids, dtype=torch.int32)
         hidden = torch.zeros((1, max_seq, hidden_size), dtype=torch.bfloat16)
@@ -106,14 +107,15 @@ class PyptoQwen14BExecutor(ModelExecutor):
             out = torch.zeros_like(hidden)
             compiled.prefill(
                 hidden,
-                seq_lens,
                 layer.input_rms_weight.view(1, -1).float().cpu(),
                 self._kernel_weight(layer.wq),
                 self._kernel_weight(layer.wk),
                 self._kernel_weight(layer.wv),
                 layer.q_norm_weight.view(1, -1).float().cpu(),
                 layer.k_norm_weight.view(1, -1).float().cpu(),
+                seq_lens,
                 block_table,
+                slot_mapping,
                 compiled.rope_cos,
                 compiled.rope_sin,
                 k_cache,
@@ -176,6 +178,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         final_hidden = hidden[0].float()
         logits = self._project_logits(model, final_hidden)
+        alloc.tokens_used = max(alloc.tokens_used, int(seq_lens[0].item()))
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:

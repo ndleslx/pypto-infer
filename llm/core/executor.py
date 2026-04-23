@@ -178,6 +178,8 @@ class ModelExecutor:
         num_heads: int,
         num_kv_heads: int,
     ) -> torch.Tensor:
+        k_ctx = k_ctx.float()
+        v_ctx = v_ctx.float()
         q_per_kv = num_heads // num_kv_heads
         k_rep = k_ctx.repeat_interleave(q_per_kv, dim=1).permute(1, 0, 2)
         v_rep = v_ctx.repeat_interleave(q_per_kv, dim=1).permute(1, 0, 2)

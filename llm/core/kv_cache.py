@@ -93,6 +93,13 @@ class KvCacheManager:
             dtype=torch.int32,
         )
 
+    def slot_mapping_for_positions(self, alloc: KvAllocation, num_tokens: int, *, max_tokens: int | None = None) -> torch.Tensor:
+        size = num_tokens if max_tokens is None else max_tokens
+        mapping = torch.full((size,), -1, dtype=torch.int32)
+        for token_index in range(num_tokens):
+            mapping[token_index] = self.slot_mapping_for_request(alloc, token_index)
+        return mapping
+
     def write_tokens(
         self,
         layer_idx: int,

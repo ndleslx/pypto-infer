@@ -19,7 +19,7 @@ import pypto.language as pl
 
 # Qwen3-14B model dimensions for initial validation.
 BATCH = 16
-MAX_SEQ = 4096
+MAX_SEQ = 128
 NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
@@ -42,6 +42,7 @@ Q_HEAD_BATCH_PAD = 8    # padded to 32-byte alignment (8 * 4 = 32)
 Q_HEAD_PAD = 16         # padded Q rows for cube alignment
 SEQ_TILE = 64           # sequence tile for attention
 SB_BATCH = 64
+BLOCK_SIZE = SEQ_TILE   # paged attention block size (matches decode)
 MLP_OUT_CHUNK = 128
 
 
@@ -57,6 +58,9 @@ def build_qwen3_14b_prefill_program(
     hidden = hidden_size
     kv_hidden = num_kv_heads * head_dim
     q_per_kv = num_heads // num_kv_heads
+    max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_blocks = batch * max_blocks_per_seq
+    cache_rows = num_blocks * num_kv_heads * BLOCK_SIZE
     half_dim = head_dim // 2
     hidden_blocks = hidden // K_CHUNK
     q_out_blocks = hidden // Q_OUT_CHUNK
@@ -66,9 +70,6 @@ def build_qwen3_14b_prefill_program(
     total_q_groups = num_kv_heads * q_groups
     attn_scale = 1.0 / (head_dim ** 0.5)
     max_ctx_blocks = (max_seq + SEQ_TILE - 1) // SEQ_TILE
-    max_blocks_per_seq = max_ctx_blocks
-    num_blocks = batch * max_blocks_per_seq
-    cache_rows = num_blocks * num_kv_heads * SEQ_TILE
     hidden_inv = 1.0 / hidden
     head_dim_inv = 1.0 / head_dim
 
@@ -78,18 +79,19 @@ def build_qwen3_14b_prefill_program(
         def qwen3_14b_prefill(
             self,
             hidden_states: pl.Tensor[[batch, max_seq, hidden], pl.BF16],
-            seq_lens: pl.Tensor[[batch], pl.INT32],
             input_rms_weight: pl.Tensor[[1, hidden], pl.FP32],
             wq: pl.Tensor[[hidden, hidden], pl.BF16],
             wk: pl.Tensor[[hidden, kv_hidden], pl.BF16],
             wv: pl.Tensor[[hidden, kv_hidden], pl.BF16],
             q_norm_weight: pl.Tensor[[1, head_dim], pl.FP32],
             k_norm_weight: pl.Tensor[[1, head_dim], pl.FP32],
+            seq_lens: pl.Tensor[[batch], pl.INT32],
             block_table: pl.Tensor[[batch * max_blocks_per_seq], pl.INT32],
+            slot_mapping: pl.Tensor[[batch * max_seq], pl.INT32],
             rope_cos: pl.Tensor[[max_seq, head_dim], pl.FP32],
             rope_sin: pl.Tensor[[max_seq, head_dim], pl.FP32],
-            k_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
-            v_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
+            k_cache: pl.InOut[pl.Tensor[[cache_rows, head_dim], pl.BF16]],
+            v_cache: pl.InOut[pl.Tensor[[cache_rows, head_dim], pl.BF16]],
             wo: pl.Tensor[[hidden, hidden], pl.BF16],
             post_rms_weight: pl.Tensor[[1, hidden], pl.FP32],
             w_gate: pl.Tensor[[hidden, intermediate_size], pl.BF16],
@@ -100,6 +102,7 @@ def build_qwen3_14b_prefill_program(
             for b in pl.parallel(0, batch, 1):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
                 block_table_base = b * max_blocks_per_seq
+                slot_mapping_base = b * max_seq
                 tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
                 for p0_idx in pl.range(tok_blocks):
                     p0 = p0_idx * TOK_TILE
@@ -223,6 +226,9 @@ def build_qwen3_14b_prefill_program(
                         pos = p0 + ti
                         ctx_len = pos + 1
                         ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                        slot = pl.tensor.read(slot_mapping, [slot_mapping_base + pos])
+                        slot_block = pl.cast(slot, pl.INDEX) // BLOCK_SIZE
+                        slot_offset = pl.cast(slot, pl.INDEX) - slot_block * BLOCK_SIZE
                         cos_row = pl.slice(rope_cos, [1, head_dim], [pos, 0])
                         sin_row = pl.slice(rope_sin, [1, head_dim], [pos, 0])
                         cos_lo = pl.slice(cos_row, [1, half_dim], [0, 0])
@@ -253,11 +259,22 @@ def build_qwen3_14b_prefill_program(
                                     pl.col_expand_mul(k_hi, cos_hi),
                                     pl.col_expand_mul(k_lo, sin_hi),
                                 )
-                                logical_block = pos // SEQ_TILE
-                                slot_offset = pos - logical_block * SEQ_TILE
-                                block_table_idx = block_table_base + logical_block
-                                pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
-                                cache_row = (pbid * num_kv_heads + ki) * SEQ_TILE + slot_offset
+                                cache_row = (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
+                                # Keep cache writes ordered with later cache readers in the runtime DAG.
+                                old_k_lo = pl.cast(
+                                    pl.reshape(pl.slice(k_cache, [1, half_dim], [cache_row, 0]), [1, half_dim]),
+                                    target_type=pl.FP32,
+                                )
+                                old_k_hi = pl.cast(
+                                    pl.reshape(pl.slice(k_cache, [1, half_dim], [cache_row, half_dim]), [1, half_dim]),
+                                    target_type=pl.FP32,
+                                )
+                                old_v = pl.cast(
+                                    pl.reshape(pl.slice(v_cache, [1, head_dim], [cache_row, 0]), [1, head_dim]),
+                                    target_type=pl.FP32,
+                                )
+                                rot_lo = pl.add(rot_lo, pl.mul(old_k_lo, 0.0))
+                                rot_hi = pl.add(rot_hi, pl.mul(old_k_hi, 0.0))
                                 k_cache = pl.assemble(
                                     k_cache,
                                     pl.cast(rot_lo, target_type=pl.BF16),
@@ -269,12 +286,13 @@ def build_qwen3_14b_prefill_program(
                                     [cache_row, half_dim],
                                 )
                                 # V cache update.
+                                v_row = pl.add(
+                                    pl.reshape(pl.slice(v_proj_tile, [1, head_dim], [ti, ki * head_dim]), [1, head_dim]),
+                                    pl.mul(old_v, 0.0),
+                                )
                                 v_cache = pl.assemble(
                                     v_cache,
-                                    pl.cast(
-                                        pl.reshape(pl.slice(v_proj_tile, [1, head_dim], [ti, ki * head_dim]), [1, head_dim]),
-                                        target_type=pl.BF16,
-                                    ),
+                                    pl.cast(v_row, target_type=pl.BF16),
                                     [cache_row, 0],
                                 )
                                 # Q RoPE + pad.
@@ -320,7 +338,7 @@ def build_qwen3_14b_prefill_program(
                                 for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                     block_table_idx = block_table_base + sb
                                     pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
-                                    cache_row0 = (pbid * num_kv_heads + kvh) * SEQ_TILE
+                                    cache_row0 = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
                                     k_tile = pl.slice(k_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
                                     raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
                                     all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
@@ -350,7 +368,7 @@ def build_qwen3_14b_prefill_program(
                                 for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                     block_table_idx = block_table_base + sb
                                     pbid = pl.cast(pl.tensor.read(block_table, [block_table_idx]), pl.INDEX)
-                                    cache_row0 = (pbid * num_kv_heads + kvh) * SEQ_TILE
+                                    cache_row0 = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
                                     exp_tile = pl.slice(all_exp_padded, [Q_HEAD_PAD, SEQ_TILE], [sb * Q_HEAD_PAD, 0])
                                     v_tile = pl.slice(v_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
                                     oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
@@ -529,9 +547,9 @@ def build_tensor_specs(
     from pypto.runtime import TensorSpec
 
     kv_hidden = num_kv_heads * head_dim
-    max_blocks_per_seq = (max_seq + SEQ_TILE - 1) // SEQ_TILE
+    max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
     num_blocks = batch * max_blocks_per_seq
-    cache_rows = num_blocks * num_kv_heads * SEQ_TILE
+    cache_rows = num_blocks * num_kv_heads * BLOCK_SIZE
 
     def init_hidden_states():
         return torch.rand(batch, max_seq, hidden_size) - 0.5
@@ -570,6 +588,16 @@ def build_tensor_specs(
     def init_block_table():
         return torch.arange(num_blocks, dtype=torch.int32)
 
+    def init_slot_mapping():
+        slots = torch.empty(batch * max_seq, dtype=torch.int32)
+        for b in range(batch):
+            for pos in range(max_seq):
+                logical_block = pos // BLOCK_SIZE
+                page_offset = pos % BLOCK_SIZE
+                phys_block = b * max_blocks_per_seq + logical_block
+                slots[b * max_seq + pos] = phys_block * BLOCK_SIZE + page_offset
+        return slots
+
     def init_k_cache():
         return torch.rand(cache_rows, head_dim) - 0.5
 
@@ -594,7 +622,6 @@ def build_tensor_specs(
     return [
         TensorSpec("hidden_states", [batch, max_seq, hidden_size], torch.bfloat16,
                    init_value=init_hidden_states),
-        TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("input_rms_weight", [1, hidden_size], torch.float32,
                    init_value=init_rms_weight),
         TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16,
@@ -607,8 +634,11 @@ def build_tensor_specs(
                    init_value=init_q_norm_weight),
         TensorSpec("k_norm_weight", [1, head_dim], torch.float32,
                    init_value=init_k_norm_weight),
+        TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("block_table", [batch * max_blocks_per_seq], torch.int32,
                    init_value=init_block_table),
+        TensorSpec("slot_mapping", [batch * max_seq], torch.int32,
+                   init_value=init_slot_mapping),
         TensorSpec("rope_cos", [max_seq, head_dim], torch.float32,
                    init_value=init_rope_cos),
         TensorSpec("rope_sin", [max_seq, head_dim], torch.float32,
@@ -650,9 +680,10 @@ def golden_qwen3_14b_prefill(tensors):
     wv = tensors["wv"]
     q_norm_weight = tensors["q_norm_weight"]
     k_norm_weight = tensors["k_norm_weight"]
-    block_table = tensors["block_table"]
     rope_cos = tensors["rope_cos"]
     rope_sin = tensors["rope_sin"]
+    block_table = tensors["block_table"]
+    slot_mapping = tensors["slot_mapping"]
     k_cache = tensors["k_cache"].clone()
     v_cache = tensors["v_cache"].clone()
     wo = tensors["wo"]
@@ -670,10 +701,10 @@ def golden_qwen3_14b_prefill(tensors):
     num_heads = hidden_size // head_dim
     q_per_kv = num_heads // num_kv_heads
     q_groups = q_per_kv // Q_HEAD_BATCH
-    max_blocks_per_seq = (max_seq + SEQ_TILE - 1) // SEQ_TILE
     half = head_dim // 2
     scale = 1.0 / math.sqrt(head_dim)
     eps = EPS
+    max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     input_rms_weight_f = input_rms_weight.float()
     wq_f = wq.float()
@@ -730,15 +761,23 @@ def golden_qwen3_14b_prefill(tensors):
             k_lo * cos_lo.unsqueeze(1) - k_hi * sin_lo.unsqueeze(1),
             k_hi * cos_hi.unsqueeze(1) + k_lo * sin_hi.unsqueeze(1),
         ], dim=-1).to(torch.bfloat16)
+        for pos in range(S):
+            slot = int(slot_mapping[b * max_seq + pos].item())
+            slot_block = slot // BLOCK_SIZE
+            slot_offset = slot % BLOCK_SIZE
+            for ki in range(num_kv_heads):
+                cache_row = (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
+                k_cache[cache_row, :] = k_rot[pos, ki, :]
+
+        # V cache write.
         v_row_bf16 = v_proj_f.view(S, num_kv_heads, head_dim).to(torch.bfloat16)
         for pos in range(S):
-            logical_block = pos // SEQ_TILE
-            slot_offset = pos % SEQ_TILE
-            pbid = int(block_table[b * max_blocks_per_seq + logical_block].item())
-            for kvh in range(num_kv_heads):
-                cache_row = (pbid * num_kv_heads + kvh) * SEQ_TILE + slot_offset
-                k_cache[cache_row, :] = k_rot[pos, kvh, :]
-                v_cache[cache_row, :] = v_row_bf16[pos, kvh, :]
+            slot = int(slot_mapping[b * max_seq + pos].item())
+            slot_block = slot // BLOCK_SIZE
+            slot_offset = slot % BLOCK_SIZE
+            for ki in range(num_kv_heads):
+                cache_row = (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
+                v_cache[cache_row, :] = v_row_bf16[pos, ki, :]
 
         # Q RoPE -> BF16.
         q_row = q_proj_f.view(S, num_heads, head_dim)
@@ -760,19 +799,15 @@ def golden_qwen3_14b_prefill(tensors):
                 q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
                 q_grp = q_rot_bf16[:S, q_base:q_base + Q_HEAD_BATCH, :]
 
+                cache_base = b * max_blocks_per_seq
                 k_padded = torch.zeros(padded_len, head_dim, dtype=torch.bfloat16)
                 v_padded = torch.zeros(padded_len, head_dim, dtype=torch.bfloat16)
                 for sb in range(max_blocks):
+                    pbid = int(block_table[cache_base + sb].item())
+                    cache_row0 = (pbid * num_kv_heads + kvh) * BLOCK_SIZE
                     s0 = sb * SEQ_TILE
-                    valid_len = min(SEQ_TILE, S - s0)
-                    if valid_len <= 0:
-                        continue
-                    pbid = int(block_table[b * max_blocks_per_seq + sb].item())
-                    cache_row0 = (pbid * num_kv_heads + kvh) * SEQ_TILE
-                    k_tile = k_cache[cache_row0 : cache_row0 + SEQ_TILE, :]
-                    v_tile = v_cache[cache_row0 : cache_row0 + SEQ_TILE, :]
-                    k_padded[s0 : s0 + valid_len] = k_tile[:valid_len]
-                    v_padded[s0 : s0 + valid_len] = v_tile[:valid_len]
+                    k_padded[s0:s0 + BLOCK_SIZE] = k_cache[cache_row0:cache_row0 + BLOCK_SIZE, :]
+                    v_padded[s0:s0 + BLOCK_SIZE] = v_cache[cache_row0:cache_row0 + BLOCK_SIZE, :]
 
                 oi = li = mi = None
 
@@ -854,12 +889,17 @@ def compile_and_run(
     runtime_profiling: bool = False,
     runtime_dir: str | None = None,
 ):
+    import os
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
     from golden import RunConfig, run
+
+    os.environ.setdefault("PTO2_RING_DEP_POOL", "131072")
+    os.environ.setdefault("PTO2_RING_TASK_WINDOW", "131072")
+    os.environ.setdefault("PTO2_RING_HEAP", "4294967296")
 
     program = build_qwen3_14b_prefill_program(
         batch=batch,
